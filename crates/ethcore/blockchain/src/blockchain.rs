@@ -170,14 +170,11 @@ pub trait BlockProvider {
     }
 
     /// Get transaction with given transaction hash.
-    fn transaction(&self, address: &TransactionAddress) -> Option<LocalizedTransaction> {
-        self.block_body(&address.block_hash).and_then(|body| {
-            self.block_number(&address.block_hash).and_then(|n| {
-                body.view()
-                    .localized_transaction_at(&address.block_hash, n, address.index)
-            })
-        })
-    }
+	fn transaction(&self, address: &TransactionAddress) -> Option<LocalizedTransaction> {
+		let body = self.block_body(&address.block_hash)?;
+		let number = self.block_number(&address.block_hash)?;
+		body.view().localized_transaction_at(&address.block_hash, number, address.index)
+	}
 
     /// Get a list of transactions for a given block.
     /// Returns None if block does not exist.
@@ -310,39 +307,24 @@ impl BlockProvider for BlockChain {
     }
 
     /// Get block header data
-    fn block_header_data(&self, hash: &H256) -> Option<encoded::Header> {
-        // Check cache first
-        {
-            let read = self.block_headers.read();
-            if let Some(v) = read.get(hash) {
-                return Some(v.clone());
-            }
-        }
+	///
+	fn block_header_data(&self, hash: &H256) -> Option<encoded::Header> {
+		if let Some(v) = self.block_headers.read().get(hash) {
+			return Some(v.clone());
+		}
 
-        // Check if it's the best block
-        {
-            let best_block = self.best_block.read();
-            if &best_block.header.hash() == hash {
-                return Some(best_block.header.encoded());
-            }
-        }
+		if self.best_block.get().map(|b| b.header.hash()) == Some(*hash) {
+			return self.best_block.get().map(|b| b.header.encoded());
+		}
 
-        // Read from DB and populate cache
-        let b = self
-            .db
-            .key_value()
-            .get(db::COL_HEADERS, hash.as_bytes())
-            .expect(
-                "Low level database error when fetching block header data. Some issue with disk?",
-            )?;
+		let b = self.db.key_value().get(db::COL_HEADERS, hash.as_bytes())?
+			.map(|raw| decompress(&raw, blocks_swapper()).into_vec())?;
 
-        let header = encoded::Header::new(decompress(&b, blocks_swapper()).into_vec());
-        let mut write = self.block_headers.write();
-        write.insert(*hash, header.clone());
-
-        self.cache_man.lock().note_used(CacheId::BlockHeader(*hash));
-        Some(header)
-    }
+		let header = encoded::Header::new(b);
+		self.block_headers.write().insert(*hash, header.clone());
+		self.cache_man.lock().note_used(CacheId::BlockHeader(*hash));
+		Some(header)
+	}
 
     /// Get block body data
     fn block_body(&self, hash: &H256) -> Option<encoded::Body> {
