@@ -114,11 +114,12 @@ impl ValidatorContract {
     ///
     /// After `posdaoTransition`, this is zero. Otherwise it is the default (`None`).
     fn report_gas_price(&self, block: BlockNumber) -> Option<U256> {
-        if self.posdao_transition? <= block {
-            Some(0.into())
-        } else {
-            None
-        }
+		if let Some(posdao_block) = self.posdao_transition {
+			if block >= posdao_block {
+				return Some(U256::zero());
+			}
+		}
+		None
     }
 }
 

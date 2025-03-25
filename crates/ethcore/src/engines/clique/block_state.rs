@@ -360,23 +360,18 @@ impl CliqueBlockState {
         true
     }
 
-    fn revert_vote(&mut self, pending_vote: PendingVote) -> bool {
-        let mut revert = false;
-        let mut remove = false;
-
-        self.votes.entry(pending_vote).and_modify(|state| {
-            if state.votes.saturating_sub(1) == 0 {
-                remove = true;
-            }
-            revert = true;
-        });
-
-        if remove {
-            self.votes.remove(&pending_vote);
-        }
-
-        revert
-    }
+	fn revert_vote(&mut self, pending_vote: PendingVote) -> bool {
+		if let Some(state) = self.votes.get_mut(&pending_vote) {
+			if state.votes <= 1 {
+				self.votes.remove(&pending_vote);
+			} else {
+				state.votes -= 1;
+			}
+			true
+		} else {
+			false
+		}
+	}
 
     fn get_current_votes_and_kind(&self, beneficiary: Address) -> Option<(usize, VoteType)> {
         let kind = self
