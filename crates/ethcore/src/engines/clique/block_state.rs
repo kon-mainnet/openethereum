@@ -149,40 +149,32 @@ impl CliqueBlockState {
     }
 
     // see https://github.com/ethereum/go-ethereum/blob/master/consensus/clique/clique.go#L474
-    fn verify(&self, header: &Header) -> Result<Address, Error> {
-        let creator = recover_creator(header)?.clone();
+	fn verify(&self, header: &Header) -> Result<Address, Error> {
+		let creator = recover_creator(header)?.clone();
 
-        // The signer is not authorized
-        if !self.signers.contains(&creator) {
-            trace!(target: "engine", "current state: {}", self);
-            Err(EngineError::NotAuthorized(creator))?
-        }
+		if !self.signers.contains(&creator) {
+			debug!(target: "engine", "Unauthorized signer: {}", creator);
+			return Err(EngineError::NotAuthorized(creator).into());
+		}
 
-        // The signer has signed a block too recently
-        if self.recent_signers.contains(&creator) {
-            trace!(target: "engine", "current state: {}", self);
-            Err(EngineError::CliqueTooRecentlySigned(creator))?
-        }
+		if self.recent_signers.contains(&creator) {
+			debug!(target: "engine", "Too recent signer: {}", creator);
+			return Err(EngineError::CliqueTooRecentlySigned(creator).into());
+		}
 
-        // Wrong difficulty
-        let inturn = self.is_inturn(header.number(), &creator);
+		let inturn = self.is_inturn(header.number(), &creator);
+		let expected_diff = if inturn { DIFF_INTURN } else { DIFF_NOTURN };
+		let found_diff = *header.difficulty();
 
-        if inturn && *header.difficulty() != DIFF_INTURN {
-            Err(BlockError::InvalidDifficulty(Mismatch {
-                expected: DIFF_INTURN,
-                found: *header.difficulty(),
-            }))?
-        }
+		if found_diff != expected_diff {
+			return Err(BlockError::InvalidDifficulty(Mismatch {
+				expected: expected_diff,
+				found: found_diff,
+			}));
+		}
 
-        if !inturn && *header.difficulty() != DIFF_NOTURN {
-            Err(BlockError::InvalidDifficulty(Mismatch {
-                expected: DIFF_NOTURN,
-                found: *header.difficulty(),
-            }))?
-        }
-
-        Ok(creator)
-    }
+		Ok(creator)
+	}
 
     /// Verify and apply a new header to current state
     pub fn apply(&mut self, header: &Header, is_checkpoint: bool) -> Result<Address, Error> {
@@ -190,26 +182,23 @@ impl CliqueBlockState {
         self.recent_signers.push_front(creator);
         self.rotate_recent_signers();
 
-        if is_checkpoint {
-            // checkpoint block should not affect previous tallying, so we check that.
-            let signers = extract_signers(header)?;
-            if self.signers != signers {
-                let invalid_signers: Vec<String> = signers
-                    .into_iter()
-                    .filter(|s| !self.signers.contains(s))
-                    .map(|s| format!("{}", s))
-                    .collect();
-                Err(EngineError::CliqueFaultyRecoveredSigners(invalid_signers))?
-            };
+		if is_checkpoint {
+			let signers = extract_signers(header)?;
+			let invalid_signers: Vec<String> = signers
+				.iter()
+				.filter(|s| !self.signers.contains(s))
+				.map(|s| s.to_string())
+				.collect();
 
-            // TODO(niklasad1): I'm not sure if we should shrink here because it is likely that next epoch
-            // will need some memory and might be better for allocation algorithm to decide whether to shrink or not
-            // (typically doubles or halves the allocted memory when necessary)
-            self.votes.clear();
-            self.votes_history.clear();
-            self.votes.shrink_to_fit();
-            self.votes_history.shrink_to_fit();
-        }
+			if !invalid_signers.is_empty() {
+				return Err(EngineError::CliqueFaultyRecoveredSigners(invalid_signers).into());
+			}
+
+			self.votes.clear();
+			self.votes_history.clear();
+			self.votes.shrink_to_fit();
+			self.votes_history.shrink_to_fit();
+		}
 
         // Contains vote
         if *header.author() != NULL_AUTHOR {
@@ -336,13 +325,27 @@ impl CliqueBlockState {
 
     /// Returns whether it makes sense to cast the specified vote in the
     /// current state (e.g. don't try to add an already authorized signer).
-    pub fn is_valid_vote(&self, address: &Address, vote_type: VoteType) -> bool {
-        let in_signer = self.signers.contains(address);
-        match vote_type {
-            VoteType::Add => !in_signer,
-            VoteType::Remove => in_signer,
-        }
-    }
+	pub fn is_valid_vote(&self, address: &Address, vote_type: VoteType) -> bool {
+		let already_signer = self.signers.contains(address);
+		match vote_type {
+			VoteType::Add => {
+				if already_signer {
+					debug!(target: "engine", "Attempted to ADD existing signer: {}", address);
+					false
+				} else {
+					true
+				}
+			}
+			VoteType::Remove => {
+				if !already_signer {
+					debug!(target: "engine", "Attempted to REMOVE non-signer: {}", address);
+					false
+				} else {
+					true
+				}
+			}
+		}
+	}
 
     /// Returns the list of current signers
     pub fn signers(&self) -> &BTreeSet<Address> {
@@ -350,15 +353,23 @@ impl CliqueBlockState {
     }
 
     // Note this method will always return `true` but it is intended for a uniform `API`
-    fn add_vote(&mut self, pending_vote: PendingVote, kind: VoteType) -> bool {
-        self.votes
-            .entry(pending_vote)
-            .and_modify(|state| {
-                state.votes = state.votes.saturating_add(1);
-            })
-            .or_insert_with(|| VoteState { kind, votes: 1 });
-        true
-    }
+	fn add_vote(&mut self, pending_vote: PendingVote, kind: VoteType) -> bool {
+		if let Some(existing) = self.votes.get(&pending_vote) {
+			if existing.kind != kind {
+				debug!(target: "engine", "Vote kind mismatch, ignoring duplicate with different kind");
+				return false;
+			}
+		}
+
+		self.votes
+			.entry(pending_vote)
+			.and_modify(|state| {
+				state.votes = state.votes.saturating_add(1);
+			})
+			.or_insert_with(|| VoteState { kind, votes: 1 });
+
+		true
+	}
 
 	fn revert_vote(&mut self, pending_vote: PendingVote) -> bool {
 		if let Some(state) = self.votes.get_mut(&pending_vote) {
@@ -389,11 +400,12 @@ impl CliqueBlockState {
         Some((votes, kind))
     }
 
-    fn rotate_recent_signers(&mut self) {
-        if self.recent_signers.len() >= (self.signers.len() / 2) + 1 {
-            self.recent_signers.pop_back();
-        }
-    }
+	fn rotate_recent_signers(&mut self) {
+		let max_recent = (self.signers.len() / 2) + 1;
+		while self.recent_signers.len() >= max_recent {
+			self.recent_signers.pop_back();
+		}
+	}
 
     fn remove_all_votes_from(&mut self, beneficiary: Address) {
         self.votes = std::mem::replace(&mut self.votes, HashMap::new())
